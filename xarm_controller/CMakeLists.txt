@@ -46,6 +46,7 @@ find_package(controller_manager_msgs REQUIRED)
 find_package(xarm_msgs REQUIRED)
 find_package(xarm_api REQUIRED)
 find_package(xarm_sdk REQUIRED)
+find_package(robot_connection_recovery REQUIRED)
 
 add_library(
   uf_robot_hardware
@@ -72,6 +73,7 @@ ament_target_dependencies(
   std_msgs
   sensor_msgs
   controller_manager_msgs
+  robot_connection_recovery
   xarm_msgs
 )
 

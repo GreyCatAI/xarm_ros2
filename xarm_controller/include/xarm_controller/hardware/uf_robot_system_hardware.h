@@ -10,6 +10,9 @@
 #define __UF_ROBOT_SYSTEM_HARDWARE_INTERFACE_H__
 
 #include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
@@ -26,6 +29,7 @@
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "controller_manager_msgs/srv/switch_controller.hpp"
 #include "xarm_api/xarm_driver.h"
+#include "robot_connection_recovery/connection_state_publisher.hpp"
 
 
 namespace uf_robot_hardware
@@ -36,6 +40,8 @@ namespace uf_robot_hardware
     {
     public:
         RCLCPP_SHARED_PTR_DEFINITIONS(UFRobotSystemHardware)
+
+        ~UFRobotSystemHardware() override;
 
         CallbackReturn on_init(const hardware_interface::HardwareInfo& info) final;
         std::vector<hardware_interface::StateInterface> export_state_interfaces() final;
@@ -71,9 +77,18 @@ namespace uf_robot_hardware
         std::vector<double> velocity_states_;
 
         bool velocity_control_;
-        bool initialized_;
+        std::atomic<bool> initialized_{false};
         bool read_ready_;
         bool reactivate_controller_later_;
+        std::atomic<bool> stopping_{false};
+        std::atomic<bool> reconnect_requested_{false};
+        std::atomic<bool> transports_connected_{false};
+        std::atomic<bool> channels_initialized_{false};
+        std::atomic<bool> connection_ready_{false};
+        std::mutex sdk_mutex_;
+        std::mutex reconnect_mutex_;
+        std::condition_variable reconnect_cv_;
+        std::thread reconnect_thread_;
 
         long int read_cnts_;
         long int read_failed_cnts_;
@@ -92,6 +107,8 @@ namespace uf_robot_hardware
 
         std::shared_ptr<rclcpp::Node> node_;
         std::shared_ptr<rclcpp::Node> hw_node_;
+        std::unique_ptr<robot_connection_recovery::ConnectionStatePublisher>
+            connection_state_publisher_;
         xarm_api::XArmDriver xarm_driver_;
         sensor_msgs::msg::JointState *joint_state_msg_;
 
@@ -112,6 +129,11 @@ namespace uf_robot_hardware
         bool _firmware_version_is_ge(int major, int minor, int revision);
 
         bool _need_reset(void);
+
+        void _on_connection_changed(bool connected, bool reported);
+        void _mark_connection_unavailable(void);
+        void _request_reconnect(void);
+        void _reconnect_loop(void);
 
         void _deactivate_controller(void);
         void _activate_controller(void);

@@ -18,6 +18,18 @@ namespace uf_robot_hardware
 {
     static rclcpp::Logger LOGGER = rclcpp::get_logger("UFACTORY.RobotHW");
 
+    UFRobotSystemHardware::~UFRobotSystemHardware()
+    {
+        stopping_.store(true);
+        reconnect_cv_.notify_all();
+        if (reconnect_thread_.joinable()) {
+            reconnect_thread_.join();
+        }
+        if (connection_state_publisher_) {
+            connection_state_publisher_->publish(false);
+        }
+    }
+
     template<typename ServiceT, typename SharedRequest, typename SharedResponse>
     int UFRobotSystemHardware::_call_request(std::shared_ptr<ServiceT> client, SharedRequest req, SharedResponse& res)
     {
@@ -54,6 +66,9 @@ namespace uf_robot_hardware
         hw_node_ = rclcpp::Node::make_shared("ufactory_robot_hw", node_options);
 
         update_goal_state_pub_ = hw_node_->create_publisher<std_msgs::msg::Empty>("/rviz/moveit/update_goal_state", 1);
+        connection_state_publisher_ =
+            std::make_unique<robot_connection_recovery::ConnectionStatePublisher>(*node_);
+        connection_state_publisher_->publish(false);
 
         std::thread th([this]() -> void {
             rclcpp::spin(node_);
@@ -154,6 +169,12 @@ namespace uf_robot_hardware
         
         // 20250318, disable xarm_driver publish joint_states
         xarm_driver_.init(node_, robot_ip_, true);
+        xarm_driver_.arm->register_connect_changed_callback(
+            std::bind(
+                &UFRobotSystemHardware::_on_connection_changed, this,
+                std::placeholders::_1, std::placeholders::_2));
+        transports_connected_.store(
+            xarm_driver_.arm->is_connected() && xarm_driver_.arm->is_reported());
         // 20250318, get joint_states msg reference from xarm_driver
         joint_state_msg_ = xarm_driver_.get_joint_states();
     }
@@ -247,9 +268,11 @@ namespace uf_robot_hardware
 
     CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
     {
-        xarm_driver_.arm->motion_enable(true);
-		xarm_driver_.arm->set_mode(velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO);
-		xarm_driver_.arm->set_state(XARM_STATE::START);
+        stopping_.store(false);
+        if (!reconnect_thread_.joinable()) {
+            reconnect_thread_ = std::thread(&UFRobotSystemHardware::_reconnect_loop, this);
+        }
+        _request_reconnect();
 
         req_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
         res_list_controller_ = std::make_shared<controller_manager_msgs::srv::ListControllers::Response>();
@@ -284,23 +307,106 @@ namespace uf_robot_hardware
     {
         RCLCPP_INFO(LOGGER, "[%s] Stopping ...please wait...", robot_ip_.c_str());
 
-        xarm_driver_.arm->set_mode(XARM_MODE::POSE);
+        stopping_.store(true);
+        reconnect_cv_.notify_all();
+        if (reconnect_thread_.joinable()) {
+            reconnect_thread_.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(sdk_mutex_);
+            if (xarm_driver_.arm->is_connected()) {
+                xarm_driver_.arm->set_mode(XARM_MODE::POSE);
+            }
+        }
+        channels_initialized_.store(false);
+        connection_ready_.store(false);
+        connection_state_publisher_->publish(false);
 
         RCLCPP_INFO(LOGGER, "[%s] System sucessfully stopped!", robot_ip_.c_str());
         return CallbackReturn::SUCCESS;
     }
 
+    void UFRobotSystemHardware::_on_connection_changed(bool connected, bool reported)
+    {
+        transports_connected_.store(connected && reported);
+        if (!connected || !reported) {
+            _mark_connection_unavailable();
+        }
+        _request_reconnect();
+    }
+
+    void UFRobotSystemHardware::_mark_connection_unavailable(void)
+    {
+        channels_initialized_.store(false);
+        initialized_ = false;
+        if (connection_ready_.exchange(false)) {
+            connection_state_publisher_->publish(false);
+            RCLCPP_ERROR(LOGGER, "[%s] Robot connection unavailable; reconnecting", robot_ip_.c_str());
+        }
+    }
+
+    void UFRobotSystemHardware::_request_reconnect(void)
+    {
+        reconnect_requested_.store(true);
+        reconnect_cv_.notify_one();
+    }
+
+    void UFRobotSystemHardware::_reconnect_loop(void)
+    {
+        while (!stopping_.load()) {
+            std::unique_lock<std::mutex> wait_lock(reconnect_mutex_);
+            reconnect_cv_.wait(wait_lock, [this] {
+                return stopping_.load() || reconnect_requested_.load();
+            });
+            wait_lock.unlock();
+            if (stopping_.load()) {
+                return;
+            }
+
+            bool initialized = false;
+            {
+                std::lock_guard<std::mutex> sdk_lock(sdk_mutex_);
+                if (!xarm_driver_.arm->is_connected() || !xarm_driver_.arm->is_reported()) {
+                    xarm_driver_.arm->connect();
+                }
+                if (xarm_driver_.arm->is_connected() && xarm_driver_.arm->is_reported()) {
+                    const int enable_result = xarm_driver_.arm->motion_enable(true);
+                    const int mode_result = xarm_driver_.arm->set_mode(
+                        velocity_control_ ? XARM_MODE::VELO_JOINT : XARM_MODE::SERVO);
+                    const int state_result = xarm_driver_.arm->set_state(XARM_STATE::START);
+                    initialized = enable_result == 0 && mode_result == 0 && state_result == 0;
+                }
+            }
+            transports_connected_.store(initialized);
+            channels_initialized_.store(initialized);
+            if (initialized) {
+                reconnect_requested_.store(false);
+                RCLCPP_INFO(LOGGER, "[%s] Robot channels initialized; waiting for fresh state", robot_ip_.c_str());
+            } else {
+                std::unique_lock<std::mutex> retry_lock(reconnect_mutex_);
+                reconnect_cv_.wait_for(retry_lock, std::chrono::seconds(1));
+            }
+        }
+    }
+
     hardware_interface::return_type UFRobotSystemHardware::read(const rclcpp::Time & time, const rclcpp::Duration &period)
     {
+        if (!channels_initialized_.load()) {
+            return hardware_interface::return_type::OK;
+        }
         read_cnts_ += 1;
         read_ready_ = _xarm_is_ready_read();
         rclcpp::Time start = node_->get_clock()->now();
 
-        bool use_new = _firmware_version_is_ge(1, 8, 103);
-        if (use_new)
-			read_code_ = xarm_driver_.arm->get_joint_states(curr_read_position_, curr_read_velocity_, curr_read_effort_);
-		else
-			read_code_ = xarm_driver_.arm->get_servo_angle(curr_read_position_);
+        bool use_new;
+        {
+            std::lock_guard<std::mutex> lock(sdk_mutex_);
+            use_new = _firmware_version_is_ge(1, 8, 103);
+            if (use_new)
+			    read_code_ = xarm_driver_.arm->get_joint_states(curr_read_position_, curr_read_velocity_, curr_read_effort_);
+		    else
+			    read_code_ = xarm_driver_.arm->get_servo_angle(curr_read_position_);
+        }
         
         curr_read_time_ = node_->get_clock()->now();
         read_ready_ = read_ready_ && _xarm_is_ready_read();
@@ -312,7 +418,7 @@ namespace uf_robot_hardware
         // if (read_cnts_ % 6000 == 0) {
         //     RCLCPP_INFO(LOGGER, "[%s] [READ] cnt: %ld, max: %f, mean: %f, failed: %ld", robot_ip_.c_str(), read_cnts_, read_max_time_, read_total_time_ / read_cnts_, read_failed_cnts_);
         // }
-        if (read_code_ == 0 && read_ready_) {
+        if (read_code_ == 0 && read_ready_ && _xarm_is_ready_write()) {
             for (int j = 0; j < info_.joints.size(); j++) {
                 position_states_[j] = curr_read_position_[j];
 				if (use_new) {
@@ -341,9 +447,14 @@ namespace uf_robot_hardware
                     position_cmds_[i] = position_states_[i];
                     velocity_cmds_[i] = 0.0;
                 }
+                initialized_ = true;
             }
             memcpy(prev_read_position_, curr_read_position_, sizeof(float) * 7);
             prev_read_time_ = curr_read_time_;
+            if (!connection_ready_.exchange(true)) {
+                connection_state_publisher_->publish(true);
+                RCLCPP_INFO(LOGGER, "[%s] Robot connection recovered with fresh state", robot_ip_.c_str());
+            }
         }
         else {
             // initialized_ = read_ready_ && _xarm_is_ready_write();
@@ -351,10 +462,13 @@ namespace uf_robot_hardware
                 read_failed_cnts_ += 1;
                 RCLCPP_INFO(LOGGER, "[%s] Read() returns: %d", robot_ip_.c_str(), read_code_);
                 if (read_code_ == ROBOT_IS_DISCONNECTED) {
-                    RCLCPP_ERROR(LOGGER, "[%s] Robot is disconnected, ros shutdown", robot_ip_.c_str());
-                    rclcpp::shutdown();
-                    exit(1);
+				    _mark_connection_unavailable();
+				    _request_reconnect();
 				}
+            }
+            if (!read_ready_) {
+                _mark_connection_unavailable();
+                _request_reconnect();
             }
         }
 
@@ -363,16 +477,13 @@ namespace uf_robot_hardware
 
     hardware_interface::return_type UFRobotSystemHardware::write(const rclcpp::Time & time, const rclcpp::Duration &period)
     {
-        if (_need_reset()) {
-            initialized_ = false;
-            _deactivate_controller();
+        if (!connection_ready_.load()) {
             return hardware_interface::return_type::OK;
         }
-        initialized_ = true;
-        if(reactivate_controller_later_)
-        {
-            _activate_controller();
-            reactivate_controller_later_ = false;
+        if (_need_reset()) {
+            _mark_connection_unavailable();
+            _request_reconnect();
+            return hardware_interface::return_type::OK;
         }
         // std::string pos_str = "[ ";
         // std::string vel_str = "[ ";
@@ -392,7 +503,10 @@ namespace uf_robot_hardware
                 cmds_float_[i] = (float)velocity_cmds_[i];
             }
             // RCLCPP_INFO(LOGGER, "[%s] velocity: %s", robot_ip_.c_str(), vel_str.c_str());
-            cmd_ret = xarm_driver_.arm->vc_set_joint_velocity(cmds_float_, true, VELO_DURATION);
+            {
+                std::lock_guard<std::mutex> lock(sdk_mutex_);
+                cmd_ret = xarm_driver_.arm->vc_set_joint_velocity(cmds_float_, true, VELO_DURATION);
+            }
             if (cmd_ret != 0) {
                 RCLCPP_WARN(LOGGER, "[%s] vc_set_joint_velocity, ret=%d", robot_ip_.c_str(), cmd_ret);
             }
@@ -404,7 +518,10 @@ namespace uf_robot_hardware
             curr_write_time_ = node_->get_clock()->now();
             if (curr_write_time_.seconds() - prev_write_time_.seconds() > 1 || _check_cmds_is_change(prev_cmds_float_, cmds_float_)) {
                 // RCLCPP_INFO(LOGGER, "[%s] positon: %s", robot_ip_.c_str(), pos_str.c_str());
-                cmd_ret = xarm_driver_.arm->set_servo_angle_j(cmds_float_, 0, 0, 0);
+                {
+                    std::lock_guard<std::mutex> lock(sdk_mutex_);
+                    cmd_ret = xarm_driver_.arm->set_servo_angle_j(cmds_float_, 0, 0, 0);
+                }
                 if (cmd_ret != 0) {
                     RCLCPP_WARN(LOGGER, "[%s] set_servo_angle_j, ret= %d", robot_ip_.c_str(), cmd_ret);
                 }
@@ -415,6 +532,11 @@ namespace uf_robot_hardware
                     }
                 }
             }
+        }
+        write_code_ = cmd_ret;
+        if (write_code_ == ROBOT_IS_DISCONNECTED) {
+            _mark_connection_unavailable();
+            _request_reconnect();
         }
 
         return hardware_interface::return_type::OK;
@@ -539,19 +661,8 @@ namespace uf_robot_hardware
             // int ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
             // RCLCPP_ERROR(LOGGER, "[%s] Write() failed, failed_ret=%d !, Setting Robot State to STOP... (ret: %d)", robot_ip_.c_str(), write_code_, ret);
             RCLCPP_ERROR(LOGGER, "[%s] Write() failed, failed_ret=%d !", robot_ip_.c_str(), write_code_);
-            if (write_code_ == SERVICE_IS_PERSISTENT_BUT_INVALID || write_code_ == SERVICE_CALL_FAILED) {
-                RCLCPP_ERROR(LOGGER, "[%s] Service is invaild, ros shutdown", robot_ip_.c_str());
-                rclcpp::shutdown();
-                exit(1);
-            }
-            else if (write_code_ == ROBOT_IS_DISCONNECTED) {
-                RCLCPP_ERROR(LOGGER, "[%s] Robot is disconnected, ros shutdown", robot_ip_.c_str());
-                rclcpp::shutdown();
-                exit(1);
-            }
             write_code_ = 0;
         }
         return is_not_ready || !write_succeed || read_code_ != 0 || !read_ready_;
     }
 }
-
